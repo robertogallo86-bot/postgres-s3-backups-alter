@@ -14,7 +14,21 @@ export async function uploadToS3({ name, filePath }: UploadToS3Props) {
     name = `${env.BUCKET_SUBFOLDER}/${name}`;
   }
 
-  await s3Client.write(name, Bun.file(filePath));
+  const localFile = Bun.file(filePath);
+  const largeDataChunks = localFile.size > 5 * 1024 * 1024; // 5MB
+  if (largeDataChunks) {
+    logger.info("Large file detected, using multipart upload...");
+
+    const s3File = s3Client.file(name);
+    const writer = s3File.writer();
+
+    for await (const chunk of localFile.stream()) {
+      void writer.write(chunk);
+    }
+    await writer.end();
+  } else {
+    await s3Client.write(name, localFile);
+  }
 
   logger.success("Upload completed.");
 }
