@@ -1,4 +1,15 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from "bun:test";
 
 interface ListedBackup {
   key: string;
@@ -32,10 +43,22 @@ const list = mock((): ListResponse => {
 const deleteObject = mock<(key: string) => void>(() => {});
 const write = mock<(name: string, file: Blob) => number>(() => 0);
 
+const writerWrite = mock<(chunk: Uint8Array) => number>(
+  (chunk) => chunk.byteLength,
+);
+const writerEnd = mock<() => Promise<number>>(async () => Promise.resolve(0));
+const writer = mock(() => ({ write: writerWrite, end: writerEnd }));
+const s3File = mock<(name: string) => { writer: typeof writer }>(() => ({
+  writer,
+}));
+
+const loggerSuccess = mock<(message: string) => void>(() => {});
+
 void mock.module("../env", () => ({ env: testEnvironment }));
 void mock.module("../lib/s3", () => ({
   s3Client: {
     delete: deleteObject,
+    file: s3File,
     list,
     write,
   },
@@ -45,7 +68,7 @@ void mock.module("../utils/logger", () => ({
     break: mock(() => {}),
     error: mock(() => {}),
     info: mock(() => {}),
-    success: mock(() => {}),
+    success: loggerSuccess,
     warn: mock(() => {}),
   },
 }));
@@ -77,6 +100,11 @@ beforeEach(() => {
   list.mockClear();
   deleteObject.mockClear();
   write.mockClear();
+  s3File.mockClear();
+  writer.mockClear();
+  writerWrite.mockClear();
+  writerEnd.mockClear();
+  loggerSuccess.mockClear();
 });
 
 describe("deleteOldBackups", () => {
@@ -165,11 +193,25 @@ describe("deleteOldBackups", () => {
   });
 });
 
+const MULTIPART_THRESHOLD = 5 * 1024 * 1024;
+const fixturesDirectory = join(tmpdir(), "postgres-s3-backups-tests");
+const smallFilePath = join(fixturesDirectory, "small-backup.tar.gz");
+const largeFilePath = join(fixturesDirectory, "large-backup.tar.gz");
+
 describe("uploadToS3", () => {
+  beforeAll(async () => {
+    await Bun.write(smallFilePath, new Uint8Array(1024));
+    await Bun.write(largeFilePath, new Uint8Array(MULTIPART_THRESHOLD + 1));
+  });
+
+  afterAll(async () => {
+    await rm(fixturesDirectory, { force: true, recursive: true });
+  });
+
   test("uploads to the bucket root when no subfolder is configured", async () => {
     await uploadToS3({
       name: "backup.tar.gz",
-      filePath: "/tmp/backup.tar.gz",
+      filePath: smallFilePath,
     });
 
     expect(write.mock.calls[0]?.[0]).toBe("backup.tar.gz");
@@ -180,7 +222,7 @@ describe("uploadToS3", () => {
 
     await uploadToS3({
       name: "backup.tar.gz",
-      filePath: "/tmp/backup.tar.gz",
+      filePath: smallFilePath,
     });
 
     expect(write).toHaveBeenCalledTimes(1);
@@ -196,8 +238,75 @@ describe("uploadToS3", () => {
     await expectToReject(async () => {
       await uploadToS3({
         name: "backup.tar.gz",
-        filePath: "/tmp/backup.tar.gz",
+        filePath: smallFilePath,
       });
     }, "S3 unavailable");
+  });
+
+  test("keeps small files on the single-request write path", async () => {
+    await uploadToS3({
+      name: "backup.tar.gz",
+      filePath: smallFilePath,
+    });
+
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(s3File).not.toHaveBeenCalled();
+    expect(writer).not.toHaveBeenCalled();
+  });
+
+  test("uses the explicit multipart writer for large files", async () => {
+    await uploadToS3({
+      name: "backup.tar.gz",
+      filePath: largeFilePath,
+    });
+
+    expect(write).not.toHaveBeenCalled();
+    expect(s3File).toHaveBeenCalledTimes(1);
+    expect(s3File.mock.calls[0]?.[0]).toBe("backup.tar.gz");
+    expect(writer).toHaveBeenCalledTimes(1);
+    expect(writerWrite).toHaveBeenCalled();
+  });
+
+  test("streams the whole large file and awaits writer.end()", async () => {
+    await uploadToS3({
+      name: "backup.tar.gz",
+      filePath: largeFilePath,
+    });
+
+    const writtenBytes = writerWrite.mock.calls.reduce(
+      (total, [chunk]) => total + chunk.byteLength,
+      0,
+    );
+
+    expect(writtenBytes).toBe(MULTIPART_THRESHOLD + 1);
+    expect(writerEnd).toHaveBeenCalledTimes(1);
+  });
+
+  test("applies the configured subfolder on the multipart path", async () => {
+    testEnvironment.BUCKET_SUBFOLDER = "postgres";
+
+    await uploadToS3({
+      name: "backup.tar.gz",
+      filePath: largeFilePath,
+    });
+
+    expect(s3File.mock.calls[0]?.[0]).toBe("postgres/backup.tar.gz");
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  test("propagates multipart writer failures without completing", async () => {
+    writerEnd.mockImplementationOnce(async () => {
+      await Promise.resolve();
+      throw new Error("Multipart upload aborted");
+    });
+
+    await expectToReject(async () => {
+      await uploadToS3({
+        name: "backup.tar.gz",
+        filePath: largeFilePath,
+      });
+    }, "Multipart upload aborted");
+
+    expect(loggerSuccess).not.toHaveBeenCalled();
   });
 });
